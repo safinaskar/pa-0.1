@@ -12,10 +12,22 @@
 
 Установка и запуск программы
 ----------------------------
-Работоспособность программы проверялась только на GNU/Linux, так что инструкции будут только для этой системы. Программа зависит от моей библиотеки libsh (http://github.com/safinaskar/libsh ). Итак, установите все зависимости (git, g++, make, cmake), затем:
+Работоспособность программы проверялась только на GNU/Linux, так что инструкции будут только для этой системы (хотя теоретически должна поддерживать любая система, включая Windows). Программа зависит от моей библиотеки libsh (http://github.com/safinaskar/libsh ), инструкции по её установке тоже будут даны ниже. Теперь нужно выполнить следующие инструкции, они будут включать скачивание и установку libsh и pa.
+
+Итак, установите все зависимости (wget, git, g++, make, cmake, flex, bison версии, по всей видимости, как минимум 3.0.3, и он должен быть установлен в /opt/bison-3.0.3), затем:
 ```shell
-cd a
-echo b
+$ wget https://github.com/safinaskar/libsh/releases/download/v0.1.0/libsh-extended-0.1.0.tar.gz
+$ tar -xf libsh-extended-0.1.0.tar.gz
+$ mkdir libsh-build
+$ cd libsh-build
+$ cmake -DCMAKE_INSTALL_PREFIX=/usr/local ../libsh-0.1.0
+$ make
+$ sudo make install
+$ cd ..
+$ git clone git@github.com:safinaskar/pa-0.1.git
+$ cd pa-0.1
+$ make
 ```
+Теперь
 
 
