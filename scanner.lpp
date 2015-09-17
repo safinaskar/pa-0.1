@@ -1,0 +1,63 @@
+%option noyywrap
+%option warn nodefault
+
+%{
+#include <libsh.h>
+
+#include "parser.tab.hpp"
+
+#define YY_DECL int \
+  yylex (yy::parser::semantic_type *yylval)
+%}
+
+%%
+
+"consts"                 { return yy::parser::token::CONSTS;         }
+"axiomatization"         { return yy::parser::token::AXIOMATIZATION; }
+"and"                    { return yy::parser::token::AND;            }
+"where"                  { return yy::parser::token::WHERE;          }
+"prefix"                 { return yy::parser::token::PREFIX;         }
+"infix"                  { return yy::parser::token::INFIX;          }
+"infixl"                 { return yy::parser::token::INFIXL;         }
+"infixr"                 { return yy::parser::token::INFIXR;         }
+"binder"                 { return yy::parser::token::BINDER;         }
+"lemma"                  { return yy::parser::token::LEMMA;          }
+"by"                     { return yy::parser::token::BY;             }
+"have"                   { return yy::parser::token::HAVE;           }
+"proof"                  { return yy::parser::token::PROOF;          }
+"show"                   { return yy::parser::token::SHOW;           }
+"qed"                    { return yy::parser::token::QED;            }
+"assumes"                { return yy::parser::token::ASSUMES;        }
+"shows"                  { return yy::parser::token::SHOWS;          }
+"print_expr"             { return yy::parser::token::PRINT_EXPR;     }
+"assume"                 { return yy::parser::token::ASSUME;         }
+"allow_deduction"        { return yy::parser::token::ALLOW_DEDUCTION; }
+"deny_deduction"         { return yy::parser::token::DENY_DEDUCTION; }
+"fix"                    { return yy::parser::token::FIX;            }
+"allow_fixing"           { return yy::parser::token::ALLOW_FIXING;   }
+"deny_fixing"            { return yy::parser::token::DENY_FIXING;    }
+"obtain"                 { return yy::parser::token::OBTAIN;         }
+"allow_obtaining"        { return yy::parser::token::ALLOW_OBTAINING; }
+"deny_obtaining"         { return yy::parser::token::DENY_OBTAINING; }
+"typedecl"               { return yy::parser::token::TYPEDECL;       }
+"note"                   { return yy::parser::token::NOTE;           }
+
+"::"                     { return yy::parser::token::COLON_COLON;    }
+"[|"                     { return yy::parser::token::LBRAKK;         }
+"|]"                     { return yy::parser::token::RBRAKK;         }
+"==>"                    { return yy::parser::token::LONGRIGHTARROW; }
+
+[():,;{}=]               { return yytext[0]; }
+
+[A-Z_a-z'][0-9A-Z_a-z']* { yylval->build (std::string (yytext)); return yy::parser::token::ID; }
+
+"\""[^"\n]*"\""          { yytext[strlen (yytext) - 1] = '\0'; yylval->build (std::string (yytext + 1)); return yy::parser::token::STR; }
+
+[0-9]+                   { yylval->build (sh_long2int (sh_xx_strtol (yytext, 0))); return yy::parser::token::INT; }
+
+[ \t\n]+                 {}
+"#"[^\n]*                {}
+
+.                        { sh_throwx ("outer scanner: unrecognized token \"%c\"", yytext[0]); }
+
+%%

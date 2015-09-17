@@ -1,0 +1,2432 @@
+// TODO: tokens with same precedence. Формализовать трёх мудрецов и онтологическое доказательство Гёделя
+
+// TODO doc: отличия от isabelle:
+// * хочу сделать частичные функции
+// * не хочу разницу между ==> и -->
+// * хочу поддержку пустых типов. как следствие, { fix a have P } не влечёт P, здесь нужен obtain
+// * работа с системой не должна быть похожа на программирование, не должно быть проблемы выбора метода доказательства
+
+// TODO TODO
+// allow proof exprs (и стиль by-доказательств, и proof-доказательств, и allow дедукцию (и by-fact доказательства))
+// allow всё, вообще всё, в том числе аксиомы. allow автоматические доказательства и практически весь синтаксис (чтобы использовать для обучения, импорта/экспорта и пр)
+
+/*
+  В типах при объявлении констант допустимы лишь типовые константы и типы на '. Последние (в объявлении константы) локальны в пределах этого объявления
+  Константы - единственные идентификаторы в выражениях, которые могут иметь разный тип в одном выражении (таким образом, если x - константа, выражение "x x" допустимо, в остальных случаях - нет
+  Иными словами, константы - единственные сущности, которые при употреблении в выражениях, "достаются" из глобального контекста с заменой всех переменных типов на новые, уникальные переменные
+  Точно также, при использовании в proof expressions глобальных фактов они "достаются" из глобального контекста (локальные факты [также, как и текущая цель и цель всей леммы] не имеют никаких унифицируемых переменных или переменных типа, поэтому не имеет смысла говорить о том, "достаются" они или нет, они не унифицируемы, т. е. не меняются при унификации)
+  В правилах допустимы типы на ', они имеют область видимости правило и означают, что вместо этого типа можно подставить любой. При парсинге самого правила эти типы не унифицируемы, при его использовании - унифицируемы. При парсинге правила типы на ' ведут себя как типовые константы, при его использовании - так же, как и неявные переменные типа (т. е. на ??')
+  Условия и заключение правила (или леммы) находятся в одном контексте, как если бы они были одним выражением с импликацией
+  К условиям и заключению леммы применяются те же правила, что и к условиям и заключению правила
+  Условия и заключение леммы далее называю её описанием
+  Под переменными типа выражения подразумеваю как явно определённые типы на ', так и неявные типы на ??'
+  Все переменные и переменные типа в описании леммы действительны на протяжении всего доказательства. И все они не унифицируемы на протяжении доказательства. Также в доказательстве не допускаются никакие другие переменные и переменные типа (даже неявные переменные типа)
+  Не предусмотрено, что будет, если описание леммы содержит неявные типы
+  Типы: константы типа, переменные типа (явные на ' и неявные на ??'). Явные определяются пользователем, неявные - это переменные, которые можно унифицировать
+  Идентификаторы в выражениях: константы, переменные (их нельзя унифицировать, пока они не заменены на идентификаторы с ?), переменные на ?, последние можно унифицировать
+
+  При парсинге правила типы констант "достаются" и типовые переменные в них заменяются на типы на ??', уникальные в пределах правила. Типы переменных кладутся равными уникальному типу на ??'. Далее происходит унификация и именно в таком виде правило запоминается (вместе с ??')
+  При парсинге шага доказательства типы констант "достаются", типовые переменные заменяются на ??', уникальные в пределах шага, типы переменных кладутся равными уникальному типу на ??' (не так важно, являются ли они уникальными в более широком контексте, так как после унификации они должны всё равно исчезнуть)
+  При парсинге proof expression правила "достаются" с заменой всех неконстантных типов на на ??', факты не достаются
+
+  Выражения вида "f (a) (%x. a)" правильно унифицируются с другими, т. к. в процессе унификации x заменится на уникальную переменную. За исключением (TODO) следующего бага: f (a) (%x. a) и f (a) (%x. x) успешно сунифицируются
+*/
+
+%skeleton "lalr1.cc"
+
+// TODO: warning: доки бизона предупреждают, что сообщения могут быть ошибочными (то же для внутреннего парсера)
+%define parse.error verbose
+
+%code requires{
+#include <memory>
+#include <string>
+#include <vector>
+
+class proof_expr
+{
+public:
+  std::string id;
+  std::vector<proof_expr> premises;
+};
+
+class step;
+
+@datatype proof
+@ctor by proof_expr by
+@ctor qed std::unique_ptr<std::vector<step>> steps, std::unique_ptr<proof> show
+@end
+
+@datatype step
+@ctor have std::string n, std::string e, std::unique_ptr<proof> p
+@ctor deduction std::string dn, std::string assume, std::unique_ptr<std::vector<step>> steps
+@ctor fix std::string fix, std::string ftype, std::unique_ptr<std::vector<step>> fsteps
+@ctor obtain std::string obtain, std::string otype, std::string oid, std::string where, std::unique_ptr<proof> oproof, std::unique_ptr<std::vector<step>> osteps
+@ctor note std::string nid, std::string note
+@end
+}
+
+%{
+#include <stdlib.h>
+#include <libsh.h>
+
+#include <map>
+#include <vector>
+#include <tuple>
+#include <set>
+
+#include "parser.tab.hpp"
+
+#define INTERNAL_ERROR sh_throwx ("%s:%d: %s: internal error", __FILE__, __LINE__, __func__)
+
+#define TIE1(v0, expr)             auto _tie_ ## v0 = (expr); auto &v0 = std::get<0> (_tie_ ## v0)
+#define TIE2(v0, v1, expr)         auto _tie_ ## v0 = (expr); auto &v0 = std::get<0> (_tie_ ## v0); auto &v1 = std::get<1> (_tie_ ## v0)
+#define TIE3(v0, v1, v2, expr)     auto _tie_ ## v0 = (expr); auto &v0 = std::get<0> (_tie_ ## v0); auto &v1 = std::get<1> (_tie_ ## v0); auto &v2 = std::get<2> (_tie_ ## v0)
+#define TIE4(v0, v1, v2, v3, expr) auto _tie_ ## v0 = (expr); auto &v0 = std::get<0> (_tie_ ## v0); auto &v1 = std::get<1> (_tie_ ## v0); auto &v2 = std::get<2> (_tie_ ## v0); auto &v3 = std::get<3> (_tie_ ## v0)
+
+int
+yylex (yy::parser::semantic_type *yylval);
+
+void
+yy::parser::error (const std::string &m)
+{
+  sh_warnx ("outer parser: %s", m.c_str ());
+}
+
+enum class debug_level {none = 0, decls, step, proof_expr, expr_unification};
+debug_level dl = debug_level::none;
+
+#define log(d, ...) do { if (dl >= d){ sh_x_printf (__VA_ARGS__); } }while(false)
+
+template <typename t> std::enable_if_t<std::is_object<t>::value, std::unique_ptr<t>>
+my_make_unique (t &&a)
+{
+  return std::make_unique<t> (std::move (a));
+}
+
+template <typename t> std::enable_if_t<std::is_object<t>::value, std::shared_ptr<t>>
+my_make_shared (t &&a)
+{
+  return std::make_shared<t> (std::move (a));
+}
+
+template <typename t> std::unique_ptr<t>
+unique_from_ptr (t *a)
+{
+  return std::unique_ptr<t> (a);
+}
+
+template <typename t> t *
+my_new (t &&a)
+{
+  return new t(std::move (a));
+}
+
+// Section. Inner
+
+enum class mixfix_kind {constant, prefix, infix, infixl, infixr, binder};
+
+class mixfix
+{
+public:
+  std::string id;
+  std::string token;
+};
+
+class mixfix_vector
+{
+public:
+  mixfix_kind k;
+  std::vector<mixfix> v;
+};
+
+// In sync with inner
+@datatype syntactic_type
+@ctor id std::string id
+@ctor func std::unique_ptr<syntactic_type> arg, std::unique_ptr<syntactic_type> res
+@end
+
+// In sync with inner
+@datatype syntactic_expr
+@ctor id std::string id
+@ctor typed std::unique_ptr<syntactic_expr> te, std::unique_ptr<syntactic_type> tt
+@ctor application std::unique_ptr<syntactic_expr> func, std::unique_ptr<syntactic_expr> arg
+@ctor lambda std::string lx, std::unique_ptr<syntactic_expr> le
+@ctor typed_lambda std::string tlx, std::unique_ptr<syntactic_type> tlt, std::unique_ptr<syntactic_expr> tle
+@end
+
+class inner_modification
+{
+private:
+  static std::map<int, mixfix_vector> mixfixes;
+  static void *handle;
+  static syntactic_expr *(*parse_expr_symbol) (const std::string &);
+  static bool inner_modified;
+
+public:
+static void
+write_parser (FILE *scanner, FILE *parser, bool is_type)
+{
+  // В gcc или glibc dl есть совершенно необъяснимый баг, возможно, этот: https://sourceware.org/bugzilla/show_bug.cgi?id=16805#c7 (см. этот мой коммент и весь баг). Баг в том, что новые .so, загруженные даже с RTLD_LOCAL, конфликтуют с другими .so, загруженными с RTLD_LOCAL при, видимо, конфликте имён и каких-то ещё обстоятельствах. Поэтому внутренний парсер может иногда выдавать syntax error, когда его нет. При помощи sed -i-хака баг удалось победить (см. мой коммент). До этого для борьбы с багом делались разные namespace'ы, это помогало, но плохо, сейчас я не буду их убирать, потому что лень. "I have to add this "sed -i" hack to my program because of this bug and this is the most hacky hack in my life"
+
+  const char *what = is_type ? "type" : "expr";
+
+  sh_x_fprintf (scanner,
+    "%%option noyywrap\n"
+    "%%option warn nodefault\n"
+    "\n"
+    "%%{\n"
+    "#include <libsh.h>\n"
+    "\n"
+    "#include \"parser.tab.hpp\"\n"
+    "\n"
+    "#define YY_DECL int \\\n"
+    "  yylex (yy_%s::parser::semantic_type *yylval)\n"
+    "%%}\n"
+    "\n"
+    "%%%%\n"
+    "\n"
+    "[()%%.] { return yytext[0]; }\n"
+    "\n"
+    "\"=>\" { return yy_%s::parser::token::RIGHTARROW; }\n"
+    "\n",
+    what, what
+  );
+
+  if (!is_type)
+    {
+      sh_x_fprintf (scanner,
+        "\"::\" { return yy_%s::parser::token::COLON_COLON; }\n"
+        "\n",
+        what
+      );
+
+      for (const auto &i : mixfixes)
+        {
+          for (const auto &j : i.second.v)
+            {
+              sh_x_fprintf (scanner, "\"%s\" { return yy_%s::parser::token::TOKEN_%s; }\n", j.token.c_str (), what, j.id.c_str ());
+            }
+        }
+
+      sh_x_fprintf (scanner, "\n");
+    }
+
+  sh_x_fprintf (scanner,
+    "[A-Z_a-z'][0-9A-Z_a-z']* { yylval->build (std::string (yytext)); return yy_%s::parser::token::ID; }\n"
+    "\n"
+    "[ \\t\\n]+ {}\n"
+    "\n"
+    ". { sh_throwx (\"inner scanner: unrecognized token \\\"%%c\\\"\", yytext[0]); }\n"
+    "\n"
+    "%%%%\n",
+    what
+  );
+
+  sh_x_fprintf (parser,
+    "%%skeleton \"lalr1.cc\"\n"
+    "%%define api.namespace {yy_%s}\n"
+    "%%define parse.error verbose\n"
+    "\n"
+    "%%code requires{\n"
+    "#include <string>\n"
+    "\n"
+    "// In sync with outer\n"
+    "class type\n"
+    "{\n"
+    "public:\n"
+    "  enum class kind {id, func};\n"
+    "  kind k;\n"
+    "  std::string id;\n"
+    "  type *arg;\n"
+    "  type *res;\n"
+    "\n"
+    "  type (void) : arg (0), res (0)\n"
+    "    {\n"
+    "    }\n"
+    "};\n"
+    "\n",
+    what
+  );
+
+  if (!is_type)
+    {
+      sh_x_fprintf (parser,
+        "// In sync with outer\n"
+        "class expr\n"
+        "{\n"
+        "public:\n"
+        "  enum class kind {id, typed, application, lambda, typed_lambda};\n"
+        "  kind k;\n"
+        "  std::string id;\n"
+        "  expr *te;\n"
+        "  type *tt;\n"
+        "  expr *func;\n"
+        "  expr *arg;\n"
+        "  std::string lx;\n"
+        "  expr *le;\n"
+        "  std::string tlx;\n"
+        "  type *tlt;\n"
+        "  expr *tle;\n"
+        "\n"
+        "  expr (void) : te (0), tt (0), func (0), arg (0), le (0), tlt (0), tle (0)\n"
+        "    {\n"
+        "    }\n"
+        "};\n"
+        "\n"
+      );
+    }
+
+  sh_x_fprintf (parser,
+    "}\n"
+    "\n"
+    "%%{\n"
+    "#include <stdlib.h>\n"
+    "\n"
+    "#include <libsh.h>\n"
+    "\n"
+    "#include \"lex.yy.hpp\"\n"
+    "#include \"parser.tab.hpp\"\n"
+    "\n"
+    "int\n"
+    "yylex (yy_%s::parser::semantic_type *yylval);\n"
+    "\n"
+    "void\n"
+    "yy_%s::parser::error (const std::string &m)\n"
+    "{\n"
+    "  sh_warnx (\"inner parser: %%s\", m.c_str ());\n"
+    "}\n"
+    "\n"
+    "%s *document;\n"
+    "%%}\n"
+    "\n"
+    "%%define api.value.type variant\n"
+    "\n"
+    "// \"=>\" has priority 0 in Isabelle\n"
+    "%%right RIGHTARROW\n"
+    "\n",
+    what, what, what
+  );
+
+  if (!is_type)
+    {
+      sh_x_fprintf (parser,
+        "// \"::\" has priority 3 in Isabelle\n"
+        "%%precedence COLON_COLON\n"
+        "\n"
+        "// Lambda production has priority 3 in Isabelle\n"
+        "%%precedence '.'\n"
+        "\n"
+      );
+
+      for (const auto &i : mixfixes)
+        {
+          const char *token;
+
+          switch (i.second.k)
+            {
+            case mixfix_kind::constant:
+            case mixfix_kind::binder:
+              token = "%token";
+              break;
+            case mixfix_kind::prefix:
+              token = "%precedence";
+              break;
+            case mixfix_kind::infix:
+              token = "%nonassoc";
+              break;
+            case mixfix_kind::infixl:
+              token = "%left";
+              break;
+            case mixfix_kind::infixr:
+              token = "%right";
+              break;
+            default:
+              INTERNAL_ERROR;
+            }
+
+          sh_x_fprintf (parser, "%s ", token);
+
+          for (const auto &j : i.second.v)
+            {
+              sh_x_fprintf (parser, "TOKEN_%s ", j.id.c_str ());
+            }
+
+          sh_x_fprintf (parser, "\n");
+        }
+
+      sh_x_fprintf (parser, "\n");
+    }
+
+  sh_x_fprintf (parser,
+    "%%token <std::string> ID\n"
+    "\n"
+    "%%start document\n"
+    "\n"
+    "%%%%\n"
+    "\n"
+    "%%type <type *> type;\n"
+    "\n"
+    "type:\n"
+    "  ID\n"
+    "    {\n"
+    "      $$ = new type;\n"
+    "      $$->k = type::kind::id;\n"
+    "      $$->id = $ID;\n"
+    "    }\n"
+    "| type[arg] RIGHTARROW type[res]\n"
+    "    {\n"
+    "      $$ = new type;\n"
+    "      $$->k = type::kind::func;\n"
+    "      $$->arg = $arg;\n"
+    "      $$->res = $res;\n"
+    "    }\n"
+    "| '(' type[a] ')'\n"
+    "    {\n"
+    "      $$ = $a;\n"
+    "    }\n"
+    "\n"
+  );
+
+  if (!is_type)
+    {
+      sh_x_fprintf (parser,
+        "%%type <expr *> atom;\n"
+        "\n"
+        "atom:\n"
+        "  ID\n"
+        "    {\n"
+        "      $$ = new expr;\n"
+        "      $$->k = expr::kind::id;\n"
+        "      $$->id = $ID;\n"
+        "    }\n"
+        "| '(' expr[a] ')'\n"
+        "    {\n"
+        "      $$ = $a;\n"
+        "    }\n"
+        "\n"
+        "%%type <expr *> application;\n"
+        "\n"
+        "application:\n"
+        "  atom[a]\n"
+        "    {\n"
+        "      $$ = $a;\n"
+        "    }\n"
+        "| application[func] atom[arg]\n"
+        "    {\n"
+        "      $$ = new expr;\n"
+        "      $$->k = expr::kind::application;\n"
+        "      $$->func = $func;\n"
+        "      $$->arg = $arg;\n"
+        "    }\n"
+        "\n"
+        "%%type <expr *> expr;\n"
+        "\n"
+        "expr:\n"
+        "  application[a]\n"
+        "    {\n"
+        "      $$ = $a;\n"
+        "    }\n"
+        "| expr[te] COLON_COLON type[tt]\n"
+        "    {\n"
+        "      $$ = new expr;\n"
+        "      $$->k = expr::kind::typed;\n"
+        "      $$->te = $te;\n"
+        "      $$->tt = $tt;\n"
+        "    }\n"
+
+        // TODO: к нему нельзя применять функцию (то же для биндеров)
+        "| '%%' ID[lx] '.' expr[le]\n"
+        "    {\n"
+        "      $$ = new expr;\n"
+        "      $$->k = expr::kind::lambda;\n"
+        "      $$->lx = $lx;\n"
+        "      $$->le = $le;\n"
+        "    }\n"
+        "| '%%' ID[tlx] COLON_COLON type[tlt] '.' expr[tle]\n"
+        "    {\n"
+        "      $$ = new expr;\n"
+        "      $$->k = expr::kind::typed_lambda;\n"
+        "      $$->tlx = $tlx;\n"
+        "      $$->tlt = $tlt;\n"
+        "      $$->tle = $tle;\n"
+        "    }\n"
+        "\n"
+      );
+
+      for (const auto &i : mixfixes)
+        {
+          for (const auto &j : i.second.v)
+            {
+              if (i.second.k == mixfix_kind::binder)
+                {
+                  sh_x_fprintf (parser, "%s", (
+                  "expr:\n"
+                  "  TOKEN_" + j.id + " ID[lx] '.' expr[le]\n"
+                  "    {\n"
+                  "      $$ = new expr;\n"
+                  "      $$->k = expr::kind::application;\n"
+                  "      $$->func = new expr;\n"
+                  "      $$->func->k = expr::kind::id;\n"
+                  "      $$->func->id = \"" + j.id + "\";\n"
+                  "      $$->arg = new expr;\n"
+                  "      $$->arg->k = expr::kind::lambda;\n"
+                  "      $$->arg->lx = $lx;\n"
+                  "      $$->arg->le = $le;\n"
+                  "    }\n"
+                  "| TOKEN_" + j.id + " ID[tlx] COLON_COLON type[tlt] '.' expr[tle]\n"
+                  "    {\n"
+                  "      $$ = new expr;\n"
+                  "      $$->k = expr::kind::application;\n"
+                  "      $$->func = new expr;\n"
+                  "      $$->func->k = expr::kind::id;\n"
+                  "      $$->func->id = \"" + j.id + "\";\n"
+                  "      $$->arg = new expr;\n"
+                  "      $$->arg->k = expr::kind::typed_lambda;\n"
+                  "      $$->arg->tlx = $tlx;\n"
+                  "      $$->arg->tlt = $tlt;\n"
+                  "      $$->arg->tle = $tle;\n"
+                  "    }\n"
+                  ).c_str ());
+
+                  continue;
+                }
+
+              std::string production;
+              std::string action;
+
+              switch (i.second.k)
+                {
+                case mixfix_kind::constant:
+                  production = "atom: TOKEN_" + j.id;
+                  action = "$$->k = expr::kind::id; $$->id = \"" + j.id + "\"";
+                  break;
+                case mixfix_kind::prefix:
+                  // TODO: к нему нельзя применить функцию
+                  production = "expr: TOKEN_" + j.id + " expr[a]";
+                  action = "$$->k = expr::kind::application; $$->func = new expr; $$->func->k = expr::kind::id; $$->func->id = \"" + j.id + "\"; $$->arg = $a";
+                  break;
+                case mixfix_kind::infix:
+                case mixfix_kind::infixl:
+                case mixfix_kind::infixr:
+                  production = "expr: expr[a] TOKEN_" + j.id + " expr[b]";
+                  action = "$$->k = expr::kind::application; $$->func = new expr; $$->func->k = expr::kind::application; $$->func->func = new expr; $$->func->func->k = expr::kind::id; $$->func->func->id = \"" + j.id + "\"; $$->func->arg = $a; $$->arg = $b";
+                  break;
+                case mixfix_kind::binder:
+                  INTERNAL_ERROR;
+                default:
+                  INTERNAL_ERROR;
+                }
+
+              sh_x_fprintf (parser, "%s\n  {\n    $$ = new expr; %s;\n  }\n\n", production.c_str (), action.c_str ());
+            }
+        }
+    }
+
+  sh_x_fprintf (parser,
+    "document:\n"
+    "  %s\n"
+    "    {\n"
+    "      document = $%s;\n"
+    "    }\n"
+    "\n"
+    "%%%%\n"
+    "\n"
+    "extern \"C\" %s *\n"
+    "parse_%s (const std::string &s)\n"
+    "{\n"
+    "  YY_BUFFER_STATE buffer = yy_scan_string (s.c_str ());\n"
+    "  {\n"
+    "    yy_%s::parser p;\n"
+    "    if (p.parse () != 0)\n"
+    "      {\n"
+    "        exit (EXIT_FAILURE);\n"
+    "      }\n"
+    "  }\n"
+    "  yy_delete_buffer (buffer);\n"
+    "  return document;\n"
+    "}\n",
+    what, what, what, what, what
+  );
+}
+
+  static void
+  add (int priority, mixfix_kind k, const std::string &id, const std::string &token)
+  {
+    if (mixfixes.count (priority) == 1 && mixfixes[priority].k != k)
+      {
+        sh_throwx ("other kind of mixfix with same priority");
+      }
+
+    mixfixes[priority].k = k;
+    mixfixes[priority].v.push_back ({});
+    mixfixes[priority].v.back ().id = id;
+    mixfixes[priority].v.back ().token = token;
+
+    if (!inner_modified)
+      {
+        sh_x_dlclose (handle);
+        inner_modified = true;
+      }
+  }
+
+  static syntactic_expr
+  parse_expr (const std::string &s)
+  {
+    if (inner_modified)
+      {
+        log (debug_level::decls, "Debug: building inner parser\n");
+
+        sh_success (sh_x_system ("rm -rf /tmp/pa/expr && mkdir /tmp/pa/expr"));
+
+        {
+          FILE *scanner = sh_x_fopen ("/tmp/pa/expr/scanner.lpp", "w");
+          FILE *parser = sh_x_fopen ("/tmp/pa/expr/parser.ypp", "w");
+          write_parser (scanner, parser, false);
+          sh_x_fclose (scanner);
+          sh_x_fclose (parser);
+        }
+
+        sh_success (sh_x_system ("cd /tmp/pa/expr && flex --header-file=lex.yy.hpp -o lex.yy.cpp scanner.lpp && /opt/bison-3.0.3/bin/bison -do parser.tab.cpp parser.ypp && sed -i 's/^ *static$//' parser.tab.cpp && c++ -std=c++14 -Wall -Wno-unused-function -shared -g -fPIC -o inner.so lex.yy.cpp parser.tab.cpp"));
+
+        {
+          handle = sh_x_dlopen ("/tmp/pa/expr/inner.so", RTLD_NOW | RTLD_LOCAL);
+
+          *(void **) &parse_expr_symbol = sh_x_dlsym (handle, "parse_expr");
+        }
+
+        inner_modified = false;
+      }
+
+    // Здесь (и в другом таком же месте) грязный хак: преобразуем дерево указателей в дерево unique_ptrs
+    syntactic_expr *ptr = (*parse_expr_symbol) (s);
+    syntactic_expr result = std::move (*ptr);
+    delete ptr;
+    return result;
+  }
+
+  static const auto &
+  get_mixfixes ()
+  {
+    return mixfixes;
+  }
+};
+
+std::map<int, mixfix_vector> inner_modification::mixfixes;
+void *inner_modification::handle;
+syntactic_expr *(*inner_modification::parse_expr_symbol) (const std::string &);
+bool inner_modification::inner_modified = true;
+
+syntactic_type *(*parse_type_symbol) (const std::string &s);
+
+class type_parser
+{
+public:
+  type_parser (void)
+  {
+    sh_success (sh_x_system ("rm -rf /tmp/pa && mkdir -p /tmp/pa/type"));
+
+    {
+      FILE *scanner = sh_x_fopen ("/tmp/pa/type/scanner.lpp", "w");
+      FILE *parser = sh_x_fopen ("/tmp/pa/type/parser.ypp", "w");
+      inner_modification::write_parser (scanner, parser, true);
+      sh_x_fclose (scanner);
+      sh_x_fclose (parser);
+    }
+
+    sh_success (sh_x_system ("cd /tmp/pa/type && flex --header-file=lex.yy.hpp -o lex.yy.cpp scanner.lpp && /opt/bison-3.0.3/bin/bison -do parser.tab.cpp parser.ypp && sed -i 's/^ *static$//' parser.tab.cpp && c++ -std=c++14 -Wall -Wno-unused-function -shared -g -fPIC -o inner.so lex.yy.cpp parser.tab.cpp"));
+
+    {
+      void *handle = sh_x_dlopen ("/tmp/pa/type/inner.so", RTLD_NOW | RTLD_LOCAL);
+
+      *(void **) &parse_type_symbol = sh_x_dlsym (handle, "parse_type");
+    }
+
+    // TODO: rm /tmp/pa
+  }
+};
+
+type_parser type_parser_instance;
+
+syntactic_type
+parse_type (const std::string &s)
+{
+  syntactic_type *ptr = (*parse_type_symbol) (s);
+  syntactic_type result = std::move (*ptr);
+  delete ptr;
+  return result;
+}
+
+// Section. cook_type
+
+@datatype type
+@ctor id std::string id
+@ctor func std::unique_ptr<type> arg, std::unique_ptr<type> res
+@end
+
+std::set<std::string> type_consts = {"prop"};
+
+std::tuple<type, std::set<std::string>>
+cook_type (const syntactic_type &t)
+{
+  switch (t.k)
+    {
+    case syntactic_type::kind::id:
+      if (t.id[0] == '\'')
+        {
+          return make_tuple (type::make_id (t.id), std::set<std::string> ({t.id}));
+        }
+      else
+        {
+          if (type_consts.count (t.id) == 0)
+            {
+              sh_throwx ("%s: undeclared", t.id.c_str ());
+            }
+
+          return make_tuple (type::make_id (t.id), std::set<std::string> ());
+        }
+    case syntactic_type::kind::func:
+      {
+        TIE2 (argt, argv, cook_type (*t.arg));
+        TIE2 (rest, resv, cook_type (*t.res));
+
+        argv.insert (resv.begin (), resv.end ());
+
+        return make_tuple (type::make_func (my_make_unique (std::move (argt)), my_make_unique (std::move (rest))), argv);
+      }
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+// Section. add_const
+
+class constant{
+public:
+  type t;
+  std::set<std::string> type_vars;
+};
+
+std::map<std::string, constant> consts;
+
+  void
+  add_const (const std::string &id, const std::string &st)
+  {
+    log (debug_level::decls, "Debug: processing new const \"%s\" :: \"%s\"\n", id.c_str (), st.c_str ());
+
+    if (consts.count (id) == 1)
+      {
+        sh_throwx ("%s: redeclaration", id.c_str ());
+      }
+
+    {
+      TIE2 (t, v, cook_type (parse_type (st)));
+      consts.emplace (id, constant {std::move (t), std::move (v)});
+    }
+  }
+
+  void
+  add_mixfix (int priority, const std::string &id, const std::string &token, mixfix_kind kind)
+  {
+    switch (kind)
+      {
+      case mixfix_kind::constant:
+        break;
+      case mixfix_kind::prefix:
+      case mixfix_kind::binder:
+        if (consts.at (id).t.k != type::kind::func)
+          {
+            sh_throwx ("prefix or binder \"%s\" (\"%s)\" is not a function", id.c_str (), token.c_str ());
+          }
+        break;
+      case mixfix_kind::infix:
+      case mixfix_kind::infixl:
+      case mixfix_kind::infixr:
+        if (consts.at (id).t.k != type::kind::func || consts.at (id).t.res->k != type::kind::func)
+          {
+            sh_throwx ("infix \"%s\" (\"%s)\" is not a second order function", id.c_str (), token.c_str ());
+          }
+        break;
+      default:
+        INTERNAL_ERROR;
+      }
+
+    inner_modification::add (priority, kind, id, token);
+  }
+
+// Section. wtype
+
+// Working type
+@datatype wtype_impl
+@nocopy
+@ctor id std::string id
+@ctor proxy std::shared_ptr<wtype_impl> proxy
+@ctor func std::shared_ptr<wtype_impl> arg, std::shared_ptr<wtype_impl> res
+@end
+
+typedef std::shared_ptr<wtype_impl> wtype;
+
+template <typename xtype_impl>
+class is_xtype_impl : public std::false_type
+{
+};
+
+template <>
+class is_xtype_impl<wtype_impl> : public std::true_type
+{
+};
+
+template <typename xtype_impl> std::enable_if_t<is_xtype_impl<xtype_impl>::value, std::string>
+pretty_str_xtype (const std::shared_ptr<xtype_impl> &t, int opriority)
+{
+  if (t->k == xtype_impl::kind::proxy)
+    {
+      return pretty_str_xtype (t->proxy, opriority);
+    }
+
+  int ipriority;
+
+  switch (t->k)
+    {
+    case xtype_impl::kind::id:
+      ipriority = 1000;
+      break;
+    case xtype_impl::kind::proxy:
+      INTERNAL_ERROR;
+    case xtype_impl::kind::func:
+      ipriority = 0;
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+
+  std::string result;
+
+  if (opriority > ipriority)
+    {
+      result += "(";
+    }
+
+  switch (t->k)
+    {
+    case xtype_impl::kind::id:
+      result += t->id;
+      break;
+    case xtype_impl::kind::proxy:
+      INTERNAL_ERROR;
+    case xtype_impl::kind::func:
+      result += pretty_str_xtype (t->arg, 1) + " => " + pretty_str_xtype (t->res, 0);
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+
+  if (opriority > ipriority)
+    {
+      result += ")";
+    }
+
+  return result;
+}
+
+wtype
+do_get_type (const type &t, const std::map<std::string, wtype> &wtype_vars)
+{
+  switch (t.k)
+    {
+    case type::kind::id:
+      if (wtype_vars.count (t.id) == 1)
+        {
+          return wtype_vars.at (t.id);
+        }
+      else
+        {
+          return my_make_shared (wtype_impl::make_id (t.id));
+        }
+    case type::kind::func:
+      return my_make_shared (wtype_impl::make_func (do_get_type (*t.arg, wtype_vars), do_get_type (*t.res, wtype_vars)));
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+template <typename xtype_impl>
+class xtype_unification_context
+{
+private:
+  std::enable_if_t<is_xtype_impl<xtype_impl>::value, int> count;
+
+public:
+  std::set<std::string> type_vars;
+
+  xtype_unification_context (void) : count (0)
+  {
+  }
+
+  std::shared_ptr<xtype_impl>
+  new_xtype ()
+  {
+    // Разделил строку, чтобы не было триграфа
+    std::string result = "??" "'$" + std::to_string (count);
+    ++count;
+    type_vars.insert (result);
+    return my_make_shared (xtype_impl::make_id (result));
+  }
+};
+
+wtype
+get_type (const type &t, const std::set<std::string> &type_vars, xtype_unification_context<wtype_impl> *ctx)
+{
+  std::map<std::string, wtype> m;
+
+  for (const auto &i : type_vars)
+    {
+      m.emplace (i, ctx->new_xtype ());
+    }
+
+  return do_get_type (t, m);
+}
+
+template <typename xtype_impl> std::enable_if_t<is_xtype_impl<xtype_impl>::value>
+xtype_occurs_check (const std::string &needle, const std::shared_ptr<xtype_impl> &haystack)
+{
+  switch (haystack->k)
+    {
+    case xtype_impl::kind::id:
+      if (haystack->id == needle)
+        {
+          sh_throwx ("type occurs check failed: \"%s\" contains itself", needle.c_str ());
+        }
+
+      break;
+    case xtype_impl::kind::proxy:
+      xtype_occurs_check (needle, haystack->proxy);
+      break;
+    case xtype_impl::kind::func:
+      xtype_occurs_check (needle, haystack->arg);
+      xtype_occurs_check (needle, haystack->res);
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+  template <typename xtype_impl> std::enable_if_t<is_xtype_impl<xtype_impl>::value>
+  unify_xtypes (std::shared_ptr<xtype_impl> a, std::shared_ptr<xtype_impl> b, xtype_unification_context<xtype_impl> *ctx)
+  {
+    while (a->k == xtype_impl::kind::proxy)
+      {
+        a = a->proxy;
+      }
+
+    while (b->k == xtype_impl::kind::proxy)
+      {
+        b = b->proxy;
+      }
+
+    if (a == b)
+      {
+        return;
+      }
+
+    if (a->k == xtype_impl::kind::id && a->id[0] == '?')
+      {
+        xtype_occurs_check (a->id, b);
+        ctx->type_vars.erase (a->id);
+        *a = xtype_impl::make_proxy (b);
+        return;
+      }
+
+    if (b->k == xtype_impl::kind::id && b->id[0] == '?')
+      {
+        xtype_occurs_check (b->id, a);
+        ctx->type_vars.erase (b->id);
+        *b = xtype_impl::make_proxy (a);
+        return;
+      }
+
+    switch (a->k)
+      {
+      case xtype_impl::kind::id:
+        if (b->k != xtype_impl::kind::id || a->id != b->id)
+          {
+            sh_throwx ("type unification failed: \"%s\" and \"%s\"", pretty_str_xtype (a, 0).c_str (), pretty_str_xtype (b, 0).c_str ());
+          }
+        break;
+      case xtype_impl::kind::proxy:
+        INTERNAL_ERROR;
+      case xtype_impl::kind::func:
+        if (b->k != xtype_impl::kind::func)
+          {
+            sh_throwx ("type unification failed: \"%s\" and \"%s\"", pretty_str_xtype (a, 0).c_str (), pretty_str_xtype (b, 0).c_str ());
+          }
+        unify_xtypes (a->arg, b->arg, ctx);
+        unify_xtypes (a->res, b->res, ctx);
+        break;
+      }
+  }
+
+// TODO: в идеале expr должно быть объектом с приватными полями, чтобы построить его можно было только унифицированным. Это нужно, чтобы, например, по результатам дедукции построить гарантированно правильную импликацию
+// TODO: существует способ знать, когда нужно "доставать" сущность (например, константу), а когда нет: если в сущности есть переменные, локальные по отношению к сущности, то её нужно "достать"
+@datatype expr
+@ctor id std::string id, wtype idt
+@ctor application std::unique_ptr<expr> func, std::unique_ptr<expr> arg
+@ctor lambda std::string lx, wtype lt, std::unique_ptr<expr> le
+@end
+
+std::string
+pretty_str_expr (const expr &e, int opriority);
+
+void
+unify_vars (std::map<std::string, wtype> *a, const std::map<std::string, wtype> &b, xtype_unification_context<wtype_impl> *ctx)
+{
+  for (const auto &i : b)
+    {
+      if (a->count (i.first) == 0)
+        {
+          a->emplace (i.first, i.second);
+        }
+      else
+        {
+          unify_xtypes ((*a)[i.first], i.second, ctx);
+        }
+    }
+}
+
+  std::tuple<expr, wtype, std::map<std::string, wtype>>
+  cook_expr (const syntactic_expr &e, xtype_unification_context<wtype_impl> *ctx)
+  {
+    switch (e.k)
+      {
+      case syntactic_expr::kind::id:
+        // TODO: этот id может быть позже добавлен как константа. И вообще все такие же баги (т. е. не грубое нарушение логики, а редкие частные случаи)
+        if (consts.count (e.id) == 0)
+          {
+            auto t = ctx->new_xtype ();
+            return make_tuple (expr::make_id (e.id, t), t, std::map<std::string, wtype> ({{e.id, t}}));
+          }
+        else
+          {
+            auto t = get_type (consts[e.id].t, consts[e.id].type_vars, ctx);
+            return make_tuple (expr::make_id (e.id, t), t, std::map<std::string, wtype> ());
+          }
+      case syntactic_expr::kind::typed:
+        {
+          TIE3 (ee, et, ev, cook_expr (*e.te, ctx));
+          TIE2 (tt, tv, cook_type (*e.tt));
+
+          ctx->type_vars.insert (tv.begin (), tv.end ());
+          unify_xtypes (et, do_get_type (tt, {}), ctx);
+
+          return make_tuple (std::move (ee), std::move (et), std::move (ev));
+        }
+      case syntactic_expr::kind::application:
+        {
+          TIE3 (fe, ft, fv, cook_expr (*e.func, ctx));
+          TIE3 (ae, at, av, cook_expr (*e.arg, ctx));
+
+          while (ft->k == wtype_impl::kind::proxy)
+            {
+              ft = ft->proxy;
+            }
+
+          switch (ft->k)
+            {
+            case wtype_impl::kind::id:
+              if (ft->id[0] == '?')
+                {
+                  ctx->type_vars.erase (ft->id);
+                  *ft = wtype_impl::make_func (ctx->new_xtype (), ctx->new_xtype ());
+                }
+              else
+                {
+                  sh_throwx ("cannot apply \"%s\" :: \"%s\" to \"%s\" :: \"%s\"", pretty_str_expr (fe, 0).c_str (), pretty_str_xtype (ft, 0).c_str (), pretty_str_expr (ae, 0).c_str (), pretty_str_xtype (at, 0).c_str ());
+                }
+
+              break;
+            case wtype_impl::kind::proxy:
+              INTERNAL_ERROR;
+            case wtype_impl::kind::func:
+              break;
+            }
+
+          unify_xtypes (ft->arg, at, ctx);
+          unify_vars (&fv, av, ctx);
+
+          return make_tuple (expr::make_application (my_make_unique (std::move (fe)), my_make_unique (std::move (ae))), ft->res, fv);
+        }
+      case syntactic_expr::kind::lambda:
+        {
+          if (consts.count (e.lx) == 1)
+            {
+              sh_throwx ("lambda variable is constant");
+            }
+
+          TIE3 (ee, et, ev, cook_expr (*e.le, ctx));
+
+          wtype lt;
+
+          if (ev.count (e.lx) == 0)
+            {
+              lt = ctx->new_xtype ();
+            }
+          else
+            {
+              lt = std::move (ev[e.lx]);
+              ev.erase (e.lx);
+            }
+
+          return make_tuple (expr::make_lambda (e.lx, lt, my_make_unique (std::move (ee))), my_make_shared (wtype_impl::make_func (lt, et)), ev);
+        }
+      case syntactic_expr::kind::typed_lambda:
+        {
+          if (consts.count (e.tlx) == 1)
+            {
+              sh_throwx ("lambda variable is constant");
+            }
+
+          TIE2 (tt, tv, cook_type (*e.tlt));
+
+          auto wt = get_type (tt, {}, ctx);
+
+          ctx->type_vars.insert (tv.begin (), tv.end ());
+
+          TIE3 (ee, et, ev, cook_expr (*e.tle, ctx));
+
+          if (ev.count (e.tlx) == 1)
+            {
+              unify_xtypes (wt, ev[e.tlx], ctx);
+              ev.erase (e.tlx);
+            }
+
+          return make_tuple (expr::make_lambda (e.tlx, wt, my_make_unique (std::move (ee))), my_make_shared (wtype_impl::make_func (wt, et)), ev);
+        }
+      default:
+        INTERNAL_ERROR;
+      }
+  }
+
+auto
+parse_and_cook_prop (const std::string &s, xtype_unification_context<wtype_impl> *ctx)
+{
+  TIE3 (e, t, v, cook_expr (inner_modification::parse_expr (s), ctx));
+  unify_xtypes (t, my_make_shared (wtype_impl::make_id ("prop")), ctx);
+  return make_tuple (std::move (e), std::move (v));
+}
+
+// Section. rule
+
+  class rule
+  {
+  public:
+    std::vector<std::shared_ptr<expr>> premises;
+    expr conclusion;
+    std::map<std::string, wtype> vars;
+    std::set<std::string> type_vars;
+  };
+
+  std::map<std::string, rule> rules;
+
+// Section. wwtype
+
+@datatype wwtype_impl
+@nocopy
+@ctor id std::string id
+@ctor proxy std::shared_ptr<wwtype_impl> proxy
+@ctor func std::shared_ptr<wwtype_impl> arg, std::shared_ptr<wwtype_impl> res
+@end
+
+typedef std::shared_ptr<wwtype_impl> wwtype;
+
+template <>
+class is_xtype_impl<wwtype_impl> : public std::true_type
+{
+};
+
+wwtype
+do_get_wtype (const wtype &t, const std::map<std::string, wwtype> &wwtype_vars)
+{
+  switch (t->k)
+    {
+    case wtype_impl::kind::id:
+      if (wwtype_vars.count (t->id) == 1)
+        {
+          return wwtype_vars.at (t->id);
+        }
+      else
+        {
+          return my_make_shared (wwtype_impl::make_id (t->id));
+        }
+    case wtype_impl::kind::proxy:
+      return do_get_wtype (t->proxy, wwtype_vars);
+    case wtype_impl::kind::func:
+      return my_make_shared (wwtype_impl::make_func (do_get_wtype (t->arg, wwtype_vars), do_get_wtype (t->res, wwtype_vars)));
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+// Section. wexpr
+@datatype wexpr_impl
+@nocopy
+@ctor id std::string id, wwtype idt
+@ctor proxy std::shared_ptr<wexpr_impl> proxy
+@ctor application std::shared_ptr<wexpr_impl> func, std::shared_ptr<wexpr_impl> arg
+@ctor lambda std::string lx, wwtype lt, std::shared_ptr<wexpr_impl> le
+@end
+
+typedef std::shared_ptr<wexpr_impl> wexpr;
+
+std::string
+pretty_str_wexpr (wexpr e, int opriority)
+{
+  while (e->k == wexpr_impl::kind::proxy){
+    e = e->proxy;
+  }
+
+  int ipriority;
+  mixfix_kind k;
+  std::string t;
+
+  switch (e->k)
+    {
+    case wexpr_impl::kind::id:
+      ipriority = 1000;
+
+          for (const auto &i : inner_modification::get_mixfixes ())
+            {
+              if (i.second.k == mixfix_kind::constant)
+                {
+                  for (const auto &j : i.second.v)
+                    {
+                      if (e->id == j.id)
+                        {
+                          ipriority = i.first;
+                          k = i.second.k;
+                          t = j.token;
+                        }
+                    }
+                }
+            }
+      break;
+    case wexpr_impl::kind::application:
+      ipriority = 999;
+
+      while (e->func->k == wexpr_impl::kind::proxy)
+        {
+          e->func = e->func->proxy;
+        }
+
+      while (e->arg->k == wexpr_impl::kind::proxy)
+        {
+          e->arg = e->arg->proxy;
+        }
+
+      if (e->func->k == wexpr_impl::kind::application)
+        {
+          while (e->func->func->k == wexpr_impl::kind::proxy)
+            {
+              e->func->func = e->func->func->proxy;
+            }
+        }
+
+      if (e->func->k == wexpr_impl::kind::id)
+        {
+          for (const auto &i : inner_modification::get_mixfixes ())
+            {
+              if (i.second.k == mixfix_kind::prefix)
+                {
+                  for (const auto &j : i.second.v)
+                    {
+                      if (e->func->id == j.id)
+                        {
+                          ipriority = i.first;
+                          k = i.second.k;
+                          t = j.token;
+                        }
+                    }
+                }
+            }
+        }
+
+      if (e->func->k == wexpr_impl::kind::application && e->func->func->k == wexpr_impl::kind::id)
+        {
+          for (const auto &i : inner_modification::get_mixfixes ())
+            {
+              if (i.second.k == mixfix_kind::infix || i.second.k == mixfix_kind::infixl || i.second.k == mixfix_kind::infixr)
+                {
+                  for (const auto &j : i.second.v)
+                    {
+                      if (e->func->func->id == j.id)
+                        {
+                          ipriority = i.first;
+                          k = i.second.k;
+                          t = j.token;
+                        }
+                    }
+                }
+            }
+        }
+
+      if (e->func->k == wexpr_impl::kind::id && e->arg->k == wexpr_impl::kind::lambda)
+        {
+          for (const auto &i : inner_modification::get_mixfixes ())
+            {
+              if (i.second.k == mixfix_kind::binder)
+                {
+                  for (const auto &j : i.second.v)
+                    {
+                      if (e->func->id == j.id)
+                        {
+                          ipriority = i.first;
+                          k = i.second.k;
+                          t = j.token;
+                        }
+                    }
+                }
+            }
+        }
+
+      break;
+    case wexpr_impl::kind::lambda:
+      ipriority = 3;
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+
+  std::string result;
+
+  if (opriority > ipriority)
+    {
+      result += "(";
+    }
+
+  switch (e->k)
+    {
+    case wexpr_impl::kind::id:
+      if (t.empty ())
+        {
+          result += e->id + " :: " + pretty_str_xtype (e->idt, 0);
+        }
+      else
+        {
+          result += t;
+        }
+
+      break;
+    case wexpr_impl::kind::application:
+      if (t.empty ())
+        {
+          result += pretty_str_wexpr (e->func, 999) + " " + pretty_str_wexpr (e->arg, 1000);
+        }
+      else
+        {
+          switch (k)
+            {
+            case mixfix_kind::constant:
+              result += t;
+              break;
+            case mixfix_kind::prefix:
+              result += t + pretty_str_wexpr (e->arg, ipriority + 1);
+              break;
+            case mixfix_kind::infix:
+              result += pretty_str_wexpr (e->func->arg, ipriority + 1) + " " + t + " " + pretty_str_wexpr (e->arg, ipriority + 1);
+              break;
+            case mixfix_kind::infixl:
+              result += pretty_str_wexpr (e->func->arg, ipriority    ) + " " + t + " " + pretty_str_wexpr (e->arg, ipriority + 1);
+              break;
+            case mixfix_kind::infixr:
+              result += pretty_str_wexpr (e->func->arg, ipriority + 1) + " " + t + " " + pretty_str_wexpr (e->arg, ipriority    );
+              break;
+            case mixfix_kind::binder:
+              result += t + " " + e->arg->lx + " :: " + pretty_str_xtype (e->arg->lt, 0) + ". " + pretty_str_wexpr (e->arg->le, 3);
+              break;
+            default:
+              INTERNAL_ERROR;
+            }
+        }
+
+      break;
+    case wexpr_impl::kind::lambda:
+      result += "%" + e->lx + " :: " + pretty_str_xtype (e->lt, 0) + ". " + pretty_str_wexpr (e->le, 3);
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+
+  if (opriority > ipriority)
+    {
+      result += ")";
+    }
+
+  return result;
+}
+
+class expr_unification_context
+{
+private:
+  int count;
+  int lcount;
+
+public:
+  xtype_unification_context<wwtype_impl> tctx;
+
+  expr_unification_context (void) : count (0), lcount (0)
+  {
+  }
+
+  wexpr
+  new_wexpr (const wwtype &t)
+  {
+    return my_make_shared (wexpr_impl::make_id ("?$" + std::to_string (count++), t));
+  }
+
+  std::string
+  new_lambda_var ()
+  {
+    return "$" + std::to_string (lcount++);
+  }
+};
+
+wexpr
+do_get_expr (const expr &e, std::map<std::string, wexpr> vars, const std::map<std::string, wwtype> &wwtype_vars, expr_unification_context *ctx)
+{
+  switch (e.k)
+    {
+    case expr::kind::id:
+      if (vars.count (e.id) == 0)
+        {
+          return my_make_shared (wexpr_impl::make_id (e.id, do_get_wtype (e.idt, wwtype_vars)));
+        }
+      else
+        {
+          return vars.at (e.id);
+        }
+    case expr::kind::application:
+      return my_make_shared (wexpr_impl::make_application (do_get_expr (*e.func, vars, wwtype_vars, ctx), do_get_expr (*e.arg, vars, wwtype_vars, ctx)));
+    case expr::kind::lambda:
+      {
+        // Сделать new_lambda_var действительно нужно, есть пример, когда это нужно
+        std::string v = ctx->new_lambda_var ();
+        wwtype t = do_get_wtype (e.lt, wwtype_vars);
+        vars[e.lx] = my_make_shared (wexpr_impl::make_id (v, t));
+        return my_make_shared (wexpr_impl::make_lambda (v, t, do_get_expr (*e.le, vars, wwtype_vars, ctx)));
+      }
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+std::string
+pretty_str_expr (const expr &e, int opriority)
+{
+  expr_unification_context ctx;
+  return pretty_str_wexpr (do_get_expr (e, {}, {}, &ctx), opriority);
+}
+
+void
+expr_occurs_check (const std::string &needle, const wexpr &haystack)
+{
+  switch (haystack->k)
+    {
+    case wexpr_impl::kind::id:
+      if (haystack->id == needle)
+        {
+          sh_throwx ("expression occurs check failed: \"%s\" contains itself", needle.c_str ());
+        }
+
+      break;
+    case wexpr_impl::kind::proxy:
+      expr_occurs_check (needle, haystack->proxy);
+      break;
+    case wexpr_impl::kind::application:
+      expr_occurs_check (needle, haystack->func);
+      expr_occurs_check (needle, haystack->arg);
+      break;
+    case wexpr_impl::kind::lambda:
+      if (needle[0] != '?')
+        {
+          INTERNAL_ERROR;
+        }
+
+      if (haystack->lx[0] == '?')
+        {
+          INTERNAL_ERROR;
+        }
+
+      expr_occurs_check (needle, haystack->le);
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+// Не клонирует типы
+// replace должен именно доставать, а не заменять на месте, т. к. дерево wexpr имеет кучу узлов, многократно юзаемых. Рассмотрим f (%x. A x) (%x. B x). Если replace заменит в первой лямбде x, то может пострадать x и во второй лямбде (особенно если обе лямбды были получены путём подстановки из одной ?-переменной, т. е. являются одним и тем же узлом
+wexpr
+replace (const wexpr &where, const std::string &what, const wexpr &for_what)
+{
+  switch (where->k)
+    {
+    case wexpr_impl::kind::id:
+      if (where->id == what)
+        {
+          return for_what;
+        }
+      else
+        {
+          return where;
+        }
+    case wexpr_impl::kind::proxy:
+      return replace (where->proxy, what, for_what);
+    case wexpr_impl::kind::application:
+      return my_make_shared (wexpr_impl::make_application (replace (where->func, what, for_what), replace (where->arg, what, for_what)));
+    case wexpr_impl::kind::lambda:
+      if (where->lx != what)
+        {
+          return my_make_shared (wexpr_impl::make_lambda (where->lx, where->lt, replace (where->le, what, for_what)));
+        }
+      else
+        {
+          return where;
+        }
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+wwtype
+type_of (const wexpr &e)
+{
+  switch (e->k)
+    {
+    case wexpr_impl::kind::id:
+      return e->idt;
+    case wexpr_impl::kind::proxy:
+      return type_of (e->proxy);
+    case wexpr_impl::kind::application:
+      return type_of (e->func)->res;
+    case wexpr_impl::kind::lambda:
+      return my_make_shared (wwtype_impl::make_func (e->lt, type_of (e->le)));
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+void
+unify_exprs (wexpr a, wexpr b, expr_unification_context *ctx)
+{
+  log (debug_level::expr_unification, "Debug: trace: unification: begin: \"%s\" and \"%s\" {\n", pretty_str_wexpr (a, 0).c_str (), pretty_str_wexpr (b, 0).c_str ());
+
+  while (a->k == wexpr_impl::kind::proxy)
+    {
+      a = a->proxy;
+    }
+
+  while (b->k == wexpr_impl::kind::proxy)
+    {
+      b = b->proxy;
+    }
+
+  if (a == b)
+    {
+      log (debug_level::expr_unification, "Debug: trace: unification: } # Equal pointers\n");
+
+      return;
+    }
+
+  if (a->k == wexpr_impl::kind::id && a->id[0] == '?')
+    {
+      expr_occurs_check (a->id, b);
+      unify_xtypes (a->idt, type_of (b), &ctx->tctx);
+      *a = wexpr_impl::make_proxy (b);
+
+      log (debug_level::expr_unification, "Debug: trace: unification: } # Assigned\n");
+
+      return;
+    }
+
+  if (b->k == wexpr_impl::kind::id && b->id[0] == '?')
+    {
+      expr_occurs_check (b->id, a);
+      unify_xtypes (b->idt, type_of (a), &ctx->tctx);
+      *b = wexpr_impl::make_proxy (a);
+
+      log (debug_level::expr_unification, "Debug: trace: unification: } # Assigned\n");
+
+      return;
+    }
+
+  std::string failed = "expression unification failed: \"" + pretty_str_wexpr (a, 0) + "\" and \"" + pretty_str_wexpr (b, 0) + "\"";
+
+  // Beta reduction
+  // TODO: этот блок будет внаглую унифицировать, даже если не унифицируется, и падать
+  do
+    {
+      if (a->k == wexpr_impl::kind::application)
+        {
+          while (a->func->k == wexpr_impl::kind::proxy)
+            {
+              a->func = a->func->proxy;
+            }
+        }
+
+      if (b->k == wexpr_impl::kind::application)
+        {
+          while (b->func->k == wexpr_impl::kind::proxy)
+            {
+              b->func = b->func->proxy;
+            }
+        }
+
+      wexpr before;
+      wexpr after;
+
+      if (a->k == wexpr_impl::kind::application && a->func->k == wexpr_impl::kind::lambda)
+        {
+          before = a;
+          after = b;
+        }
+      else if (b->k == wexpr_impl::kind::application && b->func->k == wexpr_impl::kind::lambda)
+        {
+          before = b;
+          after = a;
+        }
+      else
+        {
+          break;
+        }
+
+      if (after->k == wexpr_impl::kind::application && after->func->k == wexpr_impl::kind::lambda)
+        {
+          break;
+        }
+
+      if (after->k == wexpr_impl::kind::application && after->func->k == wexpr_impl::kind::id && after->func->id[0] == '?')
+        {
+          break;
+        }
+
+      unify_exprs (replace (before->func->le, before->func->lx, before->arg), after, ctx);
+
+      log (debug_level::expr_unification, "Debug: trace: unification: } # Beta reduction performed\n");
+
+      return;
+    }
+  while (false);
+
+  switch (a->k)
+    {
+    case wexpr_impl::kind::id:
+      if (b->k != wexpr_impl::kind::id || a->id != b->id)
+        {
+          sh_throwx ("%s", failed.c_str ());
+        }
+
+      unify_xtypes (a->idt, b->idt, &ctx->tctx);
+      break;
+    case wexpr_impl::kind::proxy:
+      INTERNAL_ERROR;
+    case wexpr_impl::kind::application:
+      if (b->k != wexpr_impl::kind::application)
+        {
+          sh_throwx ("%s", failed.c_str ());
+        }
+
+      unify_exprs (a->func, b->func, ctx);
+      unify_exprs (a->arg, b->arg, ctx);
+      break;
+    case wexpr_impl::kind::lambda:
+      {
+        if (b->k != wexpr_impl::kind::lambda)
+          {
+            sh_throwx ("%s", failed.c_str ());
+          }
+
+        std::string var = ctx->new_lambda_var ();
+
+        unify_xtypes (a->lt, b->lt, &ctx->tctx);
+
+        wexpr v = my_make_shared (wexpr_impl::make_id (var, a->lt));
+
+        unify_exprs (replace (a->le, a->lx, v), replace (b->le, b->lx, v), ctx);
+      }
+
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+
+  log (debug_level::expr_unification, "Debug: trace: unification: } # Unified normally\n");
+}
+
+// Section. proof_expr
+
+wexpr
+cook_proof_expr (const proof_expr &p, const std::map<std::string, std::shared_ptr<expr>> &facts, expr_unification_context *ctx)
+{
+  if (rules.count (p.id) == 1)
+    {
+      log (debug_level::proof_expr, "Debug: trace: %s (\n", p.id.c_str ());
+
+      if (rules[p.id].premises.size () != p.premises.size ())
+        {
+          sh_throwx ("wrong premises count");
+        }
+
+      std::map<std::string, wwtype> tv;
+
+      for (const auto &i : rules[p.id].type_vars)
+        {
+          tv.emplace (i, ctx->tctx.new_xtype ());
+        }
+
+      std::map<std::string, wexpr> v;
+
+      for (const auto &i: rules[p.id].vars)
+        {
+          v.emplace (i.first, ctx->new_wexpr (do_get_wtype (i.second, tv)));
+        }
+
+      for (std::size_t i = 0; i != p.premises.size (); ++i)
+        {
+          unify_exprs (cook_proof_expr (p.premises[i], facts, ctx), do_get_expr (*rules[p.id].premises[i], v, tv, ctx), ctx);
+        }
+
+      wexpr result = do_get_expr (rules[p.id].conclusion, v, tv, ctx);
+
+      log (debug_level::proof_expr, "Debug: trace: ) : \"%s\"\n", pretty_str_wexpr (result, 0).c_str ());
+
+      return result;
+    }
+  else if (facts.count (p.id) == 1)
+    {
+      if (p.premises.size () != 0)
+        {
+          sh_throwx ("calling fact");
+        }
+
+      wexpr result = do_get_expr (*facts.at (p.id), {}, {}, ctx);
+
+      log (debug_level::proof_expr, "Debug: trace: %s : \"%s\"\n", p.id.c_str (), pretty_str_wexpr (result, 0).c_str ());
+
+      return result;
+    }
+  else
+    {
+      sh_throwx ("%s: undeclared", p.id.c_str ());
+    }
+}
+
+// Section. proof
+
+expr
+parse_and_cook_prop_and_deny_new (const std::string &s, const std::map<std::string, wtype> &vars, const std::set<std::string> &type_vars)
+{
+  xtype_unification_context<wtype_impl> tctx;
+  TIE2 (e, v, parse_and_cook_prop (s, &tctx));
+
+  for (const auto &i : v)
+    {
+      if (vars.count (i.first) == 0)
+        {
+          sh_throwx ("%s: new var", i.first.c_str ());
+        }
+
+      unify_xtypes (vars.at (i.first), i.second, &tctx);
+    }
+
+  for (const std::string &i : tctx.type_vars)
+    {
+      if (type_vars.count (i) == 0)
+        {
+          sh_throwx ("new type \"%s\" in \"%s\"", i.c_str (), pretty_str_expr (e, 0).c_str ());
+        }
+    }
+
+  return std::move (e);
+}
+
+// TODO: можно, конечно, сделать implies произвольным выражением
+wtype prop_prop_prop = my_make_shared (wtype_impl::make_func (my_make_shared (wtype_impl::make_id ("prop")), my_make_shared (wtype_impl::make_func (my_make_shared (wtype_impl::make_id ("prop")), my_make_shared (wtype_impl::make_id ("prop"))))));
+bool deduction_allowed = false;
+std::string implies;
+
+// Триграфы, опять
+wtype a_prop_prop = my_make_shared (wtype_impl::make_func (my_make_shared (wtype_impl::make_func (my_make_shared (wtype_impl::make_id ("??" "'$all_ex")), my_make_shared (wtype_impl::make_id ("prop")))), my_make_shared (wtype_impl::make_id ("prop"))));
+
+bool fixing_allowed = false;
+bool obtaining_allowed = false;
+std::string all;
+std::string ex;
+
+void
+cook_proof (const expr &e, const proof &p, std::map<std::string, std::shared_ptr<expr>> facts, const std::map<std::string, wtype> &vars, const std::set<std::string> &type_vars);
+
+expr
+clone_expr (const expr &e)
+{
+  switch (e.k)
+    {
+    case expr::kind::id:
+      return expr::make_id (e.id, e.idt);
+    case expr::kind::application:
+      return expr::make_application (my_make_unique (clone_expr (*e.func)), my_make_unique (clone_expr (*e.arg)));
+    case expr::kind::lambda:
+      return expr::make_lambda (e.lx, e.lt, my_make_unique (clone_expr (*e.le)));
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+wtype
+parse_and_cook_and_get_type_and_deny_new (const std::string &s, const std::set<std::string> &type_vars)
+{
+  TIE2 (t, tv, cook_type (parse_type (s)));
+
+  for (const auto &i : tv)
+    {
+      if (type_vars.count (i) == 0)
+        {
+          sh_throwx ("%s: new type", i.c_str ());
+        }
+    }
+
+  return do_get_type (t, {});
+}
+
+void
+deny_var (const expr &e, const std::string v)
+{
+  switch (e.k)
+    {
+    case expr::kind::id:
+      if (e.id == v)
+        {
+          sh_throwx ("%s: var denied", v.c_str ());
+        }
+
+      break;
+    case expr::kind::application:
+      deny_var (*e.func, v);
+      deny_var (*e.arg, v);
+      break;
+    case expr::kind::lambda:
+      if (e.lx != v)
+        {
+          deny_var (*e.le, v);
+        }
+
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+}
+
+void
+cook_steps (const std::vector<step> &steps, std::map<std::string, std::shared_ptr<expr>> *facts, const std::map<std::string, wtype> &vars, const std::set<std::string> &type_vars)
+{
+  for (const auto &step : steps)
+    {
+      switch (step.k)
+        {
+        case step::kind::have:
+          {
+            log (debug_level::step, "Debug: have ...: \"%s\" ...\n", step.e.c_str ());
+
+            if (step.n != "this" && (rules.count (step.n) == 1 || facts->count (step.n) == 1))
+              {
+                sh_throwx ("%s: redeclaration", step.n.c_str ());
+              }
+
+            auto e = my_make_shared (parse_and_cook_prop_and_deny_new (step.e, vars, type_vars));
+
+            cook_proof (*e, *step.p, *facts, vars, type_vars);
+
+            (*facts)["this"] = e;
+            (*facts)[step.n] = e;
+          }
+
+          break;
+        case step::kind::deduction:
+          {
+            log (debug_level::step, "Debug: {\n");
+            log (debug_level::step, "Debug: assume ...: \"%s\"\n", step.assume.c_str ());
+
+            if (!deduction_allowed)
+              {
+                sh_throwx ("deduction denied");
+              }
+
+            if (step.dn != "this" && (rules.count (step.dn) == 1 || facts->count (step.dn) == 1))
+              {
+                sh_throwx ("%s: redeclaration", step.dn.c_str ());
+              }
+
+            auto assume = my_make_shared (parse_and_cook_prop_and_deny_new (step.assume, vars, type_vars));
+            auto my_facts = *facts;
+
+            my_facts["this"] = assume;
+            my_facts["assm"] = assume;
+            my_facts[step.dn] = assume;
+
+            cook_steps (*step.steps, &my_facts, vars, type_vars);
+
+            // clone_expr нужен, т. к. предположение и результат дедукции могут совпадать, т. е. { assume "A" }
+            (*facts)["this"] = my_make_shared (expr::make_application (my_make_unique (expr::make_application (my_make_unique (expr::make_id (implies, prop_prop_prop)), my_make_unique (std::move (*assume)))), my_make_unique (clone_expr (*(my_facts["this"])))));
+
+            log (debug_level::step, "Debug: }\n");
+          }
+
+          break;
+        case step::kind::fix:
+          {
+            log (debug_level::step, "Debug: {\n");
+            log (debug_level::step, "Debug: fix %s :: ...\n", step.fix.c_str ());
+
+            if (!fixing_allowed)
+              {
+                sh_throwx ("fixing denied");
+              }
+
+            if (consts.count (step.fix) == 1 || vars.count (step.fix) == 1)
+              {
+                sh_throwx ("%s: redeclaration", step.fix.c_str ());
+              }
+
+            wtype t = parse_and_cook_and_get_type_and_deny_new (step.ftype, type_vars);
+
+            auto my_vars = vars;
+
+            my_vars[step.fix] = t;
+
+            auto my_facts = *facts;
+
+            cook_steps (*step.fsteps, &my_facts, my_vars, type_vars);
+
+            (*facts)["this"] = my_make_shared (expr::make_application (my_make_unique (expr::make_id (all, a_prop_prop)), my_make_unique (expr::make_lambda (step.fix, t, my_make_unique (std::move (*(my_facts["this"])))))));
+
+            log (debug_level::step, "Debug: }\n");
+          }
+
+          break;
+        case step::kind::obtain:
+          {
+            log (debug_level::step, "Debug: {\n");
+            log (debug_level::step, "Debug: obtain %s :: ... where ...\n", step.obtain.c_str ());
+
+            if (!obtaining_allowed)
+              {
+                sh_throwx ("obtaining denied");
+              }
+
+            if (consts.count (step.obtain) == 1 || vars.count (step.obtain) == 1)
+              {
+                sh_throwx ("%s: redeclaration", step.obtain.c_str ());
+              }
+
+            wtype t = parse_and_cook_and_get_type_and_deny_new (step.otype, type_vars);
+
+            if (step.oid != "this" && (rules.count (step.oid) == 1 || facts->count (step.oid) == 1))
+              {
+                sh_throwx ("%s: redeclaration", step.oid.c_str ());
+              }
+
+            auto my_vars = vars;
+
+            my_vars[step.obtain] = t;
+
+            auto where = my_make_shared (parse_and_cook_prop_and_deny_new (step.where, my_vars, type_vars));
+
+            cook_proof (expr::make_application (my_make_unique (expr::make_id (ex, a_prop_prop)), my_make_unique (expr::make_lambda (step.obtain, t, my_make_unique (clone_expr (*where))))), *step.oproof, *facts, vars, type_vars);
+
+            auto my_facts = *facts;
+
+            my_facts["this"] = where;
+            my_facts["obtaining"] = where;
+            my_facts[step.oid] = where;
+
+            cook_steps (*step.osteps, &my_facts, my_vars, type_vars);
+            deny_var (*(my_facts["this"]), step.obtain);
+
+            (*facts)["this"] = my_facts["this"];
+
+            log (debug_level::step, "Debug: }\n");
+          }
+
+          break;
+        case step::kind::note:
+          {
+            log (debug_level::step, "Debug: note %s = %s\n", step.nid.c_str (), step.note.c_str ());
+
+            if (step.nid != "this" && (rules.count (step.nid) == 1 || facts->count (step.nid) == 1))
+              {
+                sh_throwx ("%s: redeclaration", step.dn.c_str ());
+              }
+
+            if (facts->count (step.note) == 0)
+              {
+                sh_throwx ("%s: undeclared", step.note.c_str ());
+              }
+
+            (*facts)["this"] = (*facts)[step.note];
+            (*facts)[step.nid] = (*facts)[step.note];
+          }
+
+          break;
+        default:
+          INTERNAL_ERROR;
+        }
+    }
+}
+
+void
+cook_proof (const expr &e, const proof &p, std::map<std::string, std::shared_ptr<expr>> facts, const std::map<std::string, wtype> &vars, const std::set<std::string> &type_vars)
+{
+  switch (p.k)
+    {
+    case proof::kind::by:
+      {
+        expr_unification_context ctx;
+        unify_exprs (do_get_expr (e, {}, {}, &ctx), cook_proof_expr (p.by, facts, &ctx), &ctx);
+      }
+      break;
+    case proof::kind::qed:
+      log (debug_level::step, "Debug: proof\n");
+
+      cook_steps (*p.steps, &facts, vars, type_vars);
+
+      log (debug_level::step, "Debug: show ...\n");
+
+      cook_proof (e, *p.show, facts, vars, type_vars);
+
+      log (debug_level::step, "Debug: qed\n");
+
+      break;
+    default:
+      INTERNAL_ERROR;
+    }
+}
+%}
+
+%define api.value.type variant
+
+%token CONSTS AXIOMATIZATION AND WHERE PREFIX INFIX INFIXL INFIXR BINDER LEMMA BY HAVE PROOF SHOW QED ASSUMES SHOWS PRINT_EXPR ASSUME ALLOW_DEDUCTION DENY_DEDUCTION FIX ALLOW_FIXING DENY_FIXING OBTAIN ALLOW_OBTAINING DENY_OBTAINING TYPEDECL NOTE
+%token COLON_COLON LBRAKK RBRAKK LONGRIGHTARROW
+
+%token <std::string> ID
+%token <std::string> STR
+%token <int> INT
+
+%start document
+
+%%
+
+constant:
+  ID COLON_COLON STR[t]
+    {
+      add_const ($ID, $t);
+    }
+| ID COLON_COLON STR[t] '(' STR[token] ')'
+    {
+      add_const ($ID, $t);
+      add_mixfix (1000, $ID, $token, mixfix_kind::constant);
+    }
+| ID COLON_COLON STR[t] '(' PREFIX STR[token] INT ')'
+    {
+      add_const ($ID, $t);
+      add_mixfix ($INT, $ID, $token, mixfix_kind::prefix);
+    }
+| ID COLON_COLON STR[t] '(' INFIX  STR[token] INT ')'
+    {
+      add_const ($ID, $t);
+      add_mixfix ($INT, $ID, $token, mixfix_kind::infix);
+    }
+| ID COLON_COLON STR[t] '(' INFIXL STR[token] INT ')'
+    {
+      add_const ($ID, $t);
+      add_mixfix ($INT, $ID, $token, mixfix_kind::infixl);
+    }
+| ID COLON_COLON STR[t] '(' INFIXR STR[token] INT ')'
+    {
+      add_const ($ID, $t);
+      add_mixfix ($INT, $ID, $token, mixfix_kind::infixr);
+    }
+| ID COLON_COLON STR[t] '(' BINDER STR[token] ')'
+    {
+      add_const ($ID, $t);
+      add_mixfix (3, $ID, $token, mixfix_kind::binder);
+    }
+
+consts:
+  constant
+| consts constant
+
+consts_and:
+  constant
+| consts_and AND constant
+
+%type <std::vector<std::string>> implication_assms;
+
+implication_assms:
+  STR
+    {
+      $$ = {$STR};
+    }
+| implication_assms[ia] ';' STR
+    {
+      $$ = std::move ($ia);
+      $$.push_back ($STR);
+    }
+
+%code requires{
+  class implication
+  {
+  public:
+    std::vector<std::string> premises;
+    std::string conclusion;
+  };
+};
+
+%type <implication> implication;
+
+implication:
+  STR
+    {
+      $$ = {{}, $STR};
+    }
+| STR[a] LONGRIGHTARROW STR[b]
+    {
+      $$ = {{$a}, $b};
+    }
+| LBRAKK implication_assms RBRAKK LONGRIGHTARROW STR
+    {
+      $$ = {$implication_assms, $STR};
+    }
+
+rule:
+  ID ':' implication
+    {
+      log (debug_level::decls, "Debug: processing new rule \"%s\" : ... ==> \"%s\"\n", $ID.c_str (), $implication.conclusion.c_str ());
+
+      if (rules.count ($ID) == 1)
+        {
+          sh_throwx ("%s: redeclaration", $ID.c_str ());
+        }
+
+      rule r;
+      xtype_unification_context<wtype_impl> ctx;
+
+      std::tie (r.conclusion, r.vars) = parse_and_cook_prop ($implication.conclusion, &ctx);
+
+      for (const auto &i : $implication.premises)
+        {
+          TIE2 (e, v, parse_and_cook_prop (i, &ctx));
+          r.premises.push_back (my_make_shared (std::move (e)));
+          unify_vars (&r.vars, v, &ctx);
+        }
+
+      r.type_vars = ctx.type_vars;
+      rules.emplace ($ID, std::move (r));
+    }
+
+rules:
+  rule
+| rules AND rule
+
+%type <proof_expr> proof_expr;
+
+proof_expr:
+  ID
+    {
+      $$.id = $ID;
+    }
+| ID '(' proof_exprs ')'
+    {
+      $$.id = $ID;
+      $$.premises = std::move ($proof_exprs);
+    }
+
+%type <std::vector<proof_expr>> proof_exprs;
+
+proof_exprs:
+  proof_expr
+    {
+      $$.push_back ($proof_expr);
+    }
+| proof_exprs[v] ',' proof_expr
+    {
+      $$ = std::move ($v);
+      $$.push_back ($proof_expr);
+    }
+
+%type <step *> step;
+
+step:
+  HAVE STR proof
+    {
+      $$ = my_new (step::make_have ("this", $STR, unique_from_ptr ($proof)));
+    }
+| HAVE ID ':' STR proof
+    {
+      $$ = my_new (step::make_have ($ID, $STR, unique_from_ptr ($proof)));
+    }
+| '{' ASSUME STR steps[i] '}'
+    {
+      $$ = my_new (step::make_deduction ("this", $STR, unique_from_ptr ($i)));
+    }
+| '{' ASSUME ID ':' STR steps[i] '}'
+    {
+      $$ = my_new (step::make_deduction ($ID, $STR, unique_from_ptr ($i)));
+    }
+| '{' FIX ID COLON_COLON STR steps step[s] '}'
+    {
+      $steps->push_back (std::move (*$s));
+      delete $s;
+      $$ = my_new (step::make_fix ($ID, $STR, unique_from_ptr ($steps)));
+    }
+| '{' OBTAIN ID[obtain] COLON_COLON STR[otype] WHERE             STR[where] proof[oproof] steps[osteps] '}'
+    {
+      $$ = my_new (step::make_obtain ($obtain, $otype, "this", $where, unique_from_ptr ($oproof), unique_from_ptr ($osteps)));
+    }
+| '{' OBTAIN ID[obtain] COLON_COLON STR[otype] WHERE ID[oid] ':' STR[where] proof[oproof] steps[osteps] '}'
+    {
+      $$ = my_new (step::make_obtain ($obtain, $otype, $oid,   $where, unique_from_ptr ($oproof), unique_from_ptr ($osteps)));
+    }
+| NOTE ID[note]
+    {
+      $$ = my_new (step::make_note ("this", $note));
+    }
+| NOTE ID[nid] '=' ID[note]
+    {
+      $$ = my_new (step::make_note ($nid, $note));
+    }
+
+%type <std::vector<step> *> steps;
+
+steps:
+  %empty
+    {
+      $$ = new std::vector<step>;
+    }
+| steps[v] step
+    {
+      $$ = $v;
+      $$->push_back (std::move (*$step));
+      delete $step;
+    }
+
+%type <proof *> proof;
+
+proof:
+  BY proof_expr
+    {
+      $$ = my_new (proof::make_by (std::move ($proof_expr)));
+    }
+| PROOF steps SHOW proof[p] QED
+    {
+      $$ = my_new (proof::make_qed (unique_from_ptr ($steps), unique_from_ptr ($p)));
+    }
+
+%code requires{
+  class assm
+  {
+  public:
+    std::string id;
+    std::string assm;
+  };
+};
+
+%type <std::vector<assm>> assms;
+
+assms:
+  %empty
+    {
+    }
+| assms[v] ASSUMES ID ':' STR
+    {
+      $$ = std::move ($v);
+      $$.push_back ({$ID, $STR});
+    }
+
+%code requires{
+  class assumes_shows
+  {
+  public:
+    std::vector<assm> assumes;
+    std::string shows;
+  };
+};
+
+%type <assumes_shows> assumes_shows;
+
+assumes_shows:
+  STR
+    {
+      $$ = {{}, $STR};
+    }
+| assms SHOWS STR
+    {
+      $$ = {$assms, $STR};
+    }
+
+document:
+  %empty
+| document CONSTS consts
+| document PRINT_EXPR STR
+    {
+      xtype_unification_context<wtype_impl> ctx;
+      printf ("%s\n", pretty_str_expr (std::get<expr> (cook_expr (inner_modification::parse_expr ($STR), &ctx)), 0).c_str ());
+    }
+| document AXIOMATIZATION
+| document AXIOMATIZATION consts_and
+| document AXIOMATIZATION WHERE rules
+| document AXIOMATIZATION consts_and WHERE rules
+| document LEMMA ID ':' assumes_shows proof
+    {
+      log (debug_level::decls, "Debug: processing lemma %s: assumes ... shows \"%s\"\n", $ID.c_str (), $assumes_shows.shows.c_str ());
+
+      if (rules.count ($ID) == 1)
+        {
+          sh_throwx ("%s: redeclaration", $ID.c_str ());
+        }
+
+      rule r;
+      xtype_unification_context<wtype_impl> ctx;
+
+      std::tie (r.conclusion, r.vars) = parse_and_cook_prop ($assumes_shows.shows, &ctx);
+
+      std::map<std::string, std::shared_ptr<expr>> facts;
+
+      for (const auto &i : $assumes_shows.assumes)
+        {
+          TIE2 (e, v, parse_and_cook_prop (i.assm, &ctx));
+          auto shared_ee = my_make_shared (std::move (e));
+          r.premises.push_back (shared_ee);
+          unify_vars (&r.vars, v, &ctx);
+          facts[i.id] = shared_ee;
+        }
+
+      for (const auto &i : ctx.type_vars)
+        {
+          if (i[0] == '?')
+            {
+              // TODO
+              sh_throwx ("implicit type vars in lemma declaration not implemented");
+            }
+        }
+
+      r.type_vars = ctx.type_vars;
+
+      {
+        cook_proof (r.conclusion, *$proof, facts, r.vars, r.type_vars);
+        delete $proof;
+      }
+
+      rules.emplace ($ID, std::move (r));
+    }
+| document ALLOW_DEDUCTION ID
+    {
+      if (consts.count ($ID) == 0)
+        {
+          sh_throwx ("%s: undeclared", $ID.c_str ());
+        }
+
+      {
+        xtype_unification_context<wtype_impl> ctx;
+        unify_xtypes (get_type (consts[$ID].t, consts[$ID].type_vars, &ctx), prop_prop_prop, &ctx);
+      }
+
+      implies = $ID;
+      deduction_allowed = true;
+    }
+| document DENY_DEDUCTION
+    {
+      deduction_allowed = false;
+    }
+| document ALLOW_FIXING ID
+    {
+      if (consts.count ($ID) == 0)
+        {
+          sh_throwx ("%s: undeclared", $ID.c_str ());
+        }
+
+      {
+        xtype_unification_context<wtype_impl> ctx;
+
+        // TODO: "fix" (и "obtain") не проверяет, что переменная соответствует тому конкретному типу, который выбран в конкретном "All"
+        unify_xtypes (get_type (consts[$ID].t, consts[$ID].type_vars, &ctx), a_prop_prop, &ctx);
+      }
+
+      all = $ID;
+      fixing_allowed = true;
+    }
+| document DENY_FIXING
+    {
+      fixing_allowed = false;
+    }
+| document ALLOW_OBTAINING ID
+    {
+      if (consts.count ($ID) == 0)
+        {
+          sh_throwx ("%s: undeclared", $ID.c_str ());
+        }
+
+      {
+        xtype_unification_context<wtype_impl> ctx;
+
+        unify_xtypes (get_type (consts[$ID].t, consts[$ID].type_vars, &ctx), a_prop_prop, &ctx);
+      }
+
+      ex = $ID;
+      obtaining_allowed = true;
+    }
+| document DENY_OBTAINING ID
+    {
+      obtaining_allowed = false;
+    }
+| document TYPEDECL ID
+    {
+      if (type_consts.count ($ID) == 1)
+        {
+          sh_throwx ("%s: redeclaration", $ID.c_str ());
+        }
+
+      type_consts.insert ($ID);
+    }
+
+%%
+
+int
+main (int, char *argv[])
+{
+  sh_init (argv[0]);
+
+  if (argv[1] != NULL)
+    {
+      std::string s = argv[1];
+
+      if (s == "--decls")
+        {
+          dl = debug_level::decls;
+        }
+      else if (s == "--step")
+        {
+          dl = debug_level::step;
+        }
+      else if (s == "--proof-expr")
+        {
+          dl = debug_level::proof_expr;
+        }
+      else if (s == "--expr-unification")
+        {
+          dl = debug_level::expr_unification;
+        }
+    }
+
+  yy::parser p;
+  if (p.parse () != 0)
+    {
+      return EXIT_FAILURE;
+    }
+}
